@@ -1,0 +1,726 @@
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- Overall level code  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+
+create table india_growth.anz_xp_overall_v2
+ select a.* 
+        ,b.shopping_sessions
+        ,b.requests
+        ,b.completed_sessions
+
+        ,c.eaters
+        ,c.completed_trips as eats_completed_trips
+        ,c.eats_trips
+        ,c.grocery_liquor_trips
+        ,c.eats_gb
+        ,c.grocery_liquor_gb
+        ,c.requests as eats_requests
+        ,c.sessions as eats_sessions
+        ,c.compltd_ssn_eats as eats_completed_session
+
+  
+   from india_growth.anz_xp_res_v3 as a 
+   
+    left join india_growth.anz_xp_ssn_v1 as b 
+     on a.client_uuid = b.client_uuid and a.campaign_name = b.campaign_name and a.cohort = b.cohort  and a.country_id = b.country_id
+     
+     left join india_growth.anz_xp_eats_v1 as c 
+      on a.client_uuid = c.client_uuid and a.campaign_name = c.campaign_name and a.cohort = c.cohort  and a.country_id = c.country_id
+      
+-- 934531    
+     
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- Aggregated code  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , '1 all cohorts' as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , quarter_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , lifetime_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )
+
+ ,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , member as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )   
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- T test for overall metrics  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+
+     select a.*
+         , (gb + eats_gb + grocery_liquor_gb )overall_gb
+        , (completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+        , (promo_spend)promo_spend 
+        , (gb + eats_gb + grocery_liquor_gb - promo_spend )adjusted_gb
+
+      from india_growth.anz_xp_overall_v2 as a
+
+
+
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- Overall level all metrics code  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , '1 all cohorts' as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , quarter_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , lifetime_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4
+
+    )
+
+ ,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , member as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4
+
+    )   
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , '1 all cohorts' as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , quarter_freq as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , lifetime_freq as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4
+
+    )
+
+,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , member as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4
+
+    )   
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+
+
+ with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , '1 all cohorts' as segment
+
+       , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+     -- , country_id
+      , quarter_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , lifetime_freq as segment
+
+       , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4
+
+    )
+
+ ,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , member as segment
+
+       , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4
+
+    )
+
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
