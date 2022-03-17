@@ -1,0 +1,4005 @@
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------Rides GB and trips metrics --------------------------------------------
+
+-- 'global_anz_e2r_beanstalk_new_riders'
+-- 2022-01-19  to 2022-02-20 
+
+campaign_name : BSTALK_E2R_XP3
+treatment_tag1: ANZE2R_T1
+treatment_tag2: ANZE2R_T2
+treatment_tag3: ANZE2R_T3
+control_tag:  ANZE2R_C
+
+2022-01-19 to 2022-02-20
+------------------------------------------------------------------------------------------------------------------------------------
+
+
+create table india_growth.anz_xp_base_v2 as 
+
+--------------------
+--- Users base for different cohorts (treatments vs control )
+----------------------
+with xp_users as (
+    select 
+         '{{campaign_name}}' as campaign_name
+        ,name as tag_name 
+        ,dy.country_id
+        ,case
+            when name in ('{{treatment_tag1}}') then 'treatment1'
+            when name in ('{{treatment_tag2}}') then 'treatment2'
+            when name in ('{{treatment_tag3}}') then 'treatment3'
+            when name in ('{{control_tag}}') then 'control'
+         end as cohort 
+        ,tags.user_uuid as client_uuid
+        from raw_etl_data.api_user_tags  as tags
+        join dwh.dim_eater dc on tags.user_uuid = dc.eater_uuid   --- referenced freq city id to map to country
+        join dwh.dim_city dy on dc.primary_city_id = dy.city_id
+        where 1=1 
+
+        and name in ('{{control_tag}}' , '{{treatment_tag1}}', '{{treatment_tag2}}' , '{{treatment_tag3}}')
+        and deleted_at is null
+        and dy.country_id IN (10,126)
+     )
+
+-- --- user base split--
+--     select treatment_group_key , count(distinct randomization_unit_id) user
+--     from xp_users
+--     group by 1
+
+--------------------
+---  XP base for the campaign 
+----------------------
+
+,xp_base as (
+        select 
+         xp.campaign_name
+        ,xp.cohort
+        ,xp.tag_name
+        ,xp.country_id
+        ,client_uuid
+      --  ,count(distinct client_uuid) as users
+
+        from  xp_users as xp
+         group by 1,2,3,4,5
+       )
+
+
+--------------------
+---  user segment for the campaign 
+----------------------
+
+,L12w_segment_table as (
+        select
+            xp.campaign_name
+            ,xp.cohort
+            ,xp.tag_name
+            ,xp.country_id
+            ,xp.client_uuid
+            ,count(distinct ft.workflow_uuid) as trips_L12w
+
+        from 
+           xp_base as xp
+        join eds.fact_eats_trip ft
+         on 
+           ft.client_uuid = xp.client_uuid
+
+      and date(datestr) BETWEEN DATE_ADD('day', -83, date('{{xp_date}}')) and date('{{xp_date}}')
+         and is_completed = true 
+    
+      group by 1,2,3,4,5
+      )
+
+,life_trips as  
+      (
+        select
+            xp.campaign_name
+            ,xp.cohort
+            ,xp.tag_name
+            ,xp.country_id
+            ,ft.client_uuid
+            
+            ,count(distinct ft.workflow_uuid) as trips_Lifetime
+
+        from 
+           xp_base as xp
+        join eds.fact_eats_trip ft
+         on 
+           ft.client_uuid = xp.client_uuid
+
+      and date(datestr) <  date('{{xp_date}}')
+         and is_completed = true 
+    
+      group by 1,2,3,4,5
+      )
+
+,member as 
+      (  select
+            xp.client_uuid
+            , xp.campaign_name
+            , xp.cohort
+            , xp.tag_name
+            ,xp.country_id
+          --  , MIN(xp.treatment_group_key) as treatment_group_key
+            -- , MIN(xp.begin_effective_timestamp) as begin_effective_timestamp
+          --  ,  MIN(first_trip_request_timestamp) as first_trip_request_timestamp
+            , CASE WHEN COUNT(DISTINCT s.msg.passuuid) > 0 THEN 1 ELSE 0 END as is_pass_purchased
+        from
+            xp_users xp
+        LEFT JOIN
+            rawdata.kafka_hp_multipass_pass_purchases_nodedup s
+            ON xp.client_uuid=s.msg.rideruuid
+            AND s.msg.purchasesuccess = TRUE
+            AND s.msg.offertype = 'UberPassOffer'
+        --  AND s.msg.appname = 'client'  ---  commented to include purchase on both apps
+
+            -- AND DATE_PARSE(REPLACE(REPLACE(s.msg.purchasetimestamp, 'T', ' '), 'Z', ''), '%Y-%m-%d %H:%i:%s') >= xp.begin_effective_timestamp 
+            -- AND DATE_PARSE(REPLACE(REPLACE(s.msg.purchasetimestamp, 'T', ' '), 'Z', ''), '%Y-%m-%d %H:%i:%s') < xp.begin_effective_timestamp + INTERVAL '28' DAY
+
+            AND s.datestr < '{{xp_date}}' 
+            and cast(DATE_PARSE(substr('2022-01-22T07:14:11Z',1,10) , '%Y-%m-%d') as date) >=  Date('{{xp_date}}')
+        GROUP BY
+            1,2,3,4,5
+        )
+
+
+,xp_cohort as (
+
+       select  
+             xp.campaign_name
+            ,xp.cohort
+            ,xp.tag_name
+            ,xp.country_id
+            ,xp.client_uuid
+            ,trips_L12w
+            ,trips_Lifetime
+            ,is_pass_purchased
+
+            ,case when trips_L12w IN (1,2) then '3 Low'
+            when trips_L12w BETWEEN 3 and 8 then '4 Med'
+            when trips_L12w between 9 and 17 then '5 Frequent'
+            when trips_L12w between 18 and 35 then '6 High'
+            when trips_L12w > 35 then '7 Power'
+          --  when trips_Lifetime <5 then '8 early lifecycle' 
+            else '8 other' 
+             end as quarter_freq 
+
+          ,case  when trips_Lifetime <5 then '1 early lifecycle' 
+            else '2 other' 
+             end as lifetime_freq 
+
+           ,case  when is_pass_purchased = 1 then '1 member' 
+            else '2 non member' 
+             end as member
+
+
+         from  xp_base as xp 
+         left join L12w_segment_table as a
+          on xp.client_uuid = a.client_uuid and xp.campaign_name = a.campaign_name and xp.cohort = a.cohort  and xp.country_id = a.country_id
+
+         left join life_trips as b
+          on xp.client_uuid = b.client_uuid and xp.campaign_name = b.campaign_name and xp.cohort = b.cohort  and xp.country_id = b.country_id
+
+        left join member as c
+          on xp.client_uuid = c.client_uuid and xp.campaign_name = c.campaign_name and xp.cohort = c.cohort  and xp.country_id = c.country_id
+
+      
+         )
+
+
+    select * from xp_cohort 
+
+--934531
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------
+
+--------------------
+---  trip data for the campaign 
+----------------------
+
+create table india_growth.anz_xp_res_v3 as 
+
+with rides_trips as (
+        select  xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,count(ft.uuid) as completed_trips
+             --   ,count(distinct xp.client_uuid) as riders
+
+              from india_growth.anz_xp_base_v2 xp 
+               left join dwh.fact_trip ft 
+                on ft.client_uuid = xp.client_uuid
+                
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date ('{{xp_date}}')
+                group by 1,2,3,4,5,6,7,8
+            )
+
+, rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,completed_trips
+
+                , sum(case when ft.client_uuid is not null and ac.user_uuid is null then 1 else 0 end) as ft_user_ct
+        
+     from rides_trips xp 
+      left join dwh.fact_trip ft 
+        on ft.client_uuid = xp.client_uuid
+         and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')
+          
+        left join dwh.analytics_client as ac 
+             on xp.client_uuid = ac.user_uuid
+             and date(first_trip_request_timestamp) < date('{{xp_date}}')
+       
+     --   where ac.user_uuid is null        
+        group by 1,2,3,4,5,6,7,8,9
+
+        )
+
+, trip_kpis as (
+
+    select 
+    
+               xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,completed_trips
+                ,ft_user_ct
+
+                , sum(gross_bookings_usd ) as gb
+
+        -- , max(cast(operational_date as timestamp)) as max_date_trips
+        -- , min(cast(operational_date as timestamp)) as min_date_trips
+    
+    from rides_first_trips xp 
+    left join secure_finance.fds_jobs_rides_op_dt fds 
+     
+     on xp.client_uuid = fds.client_uuid 
+
+    and fds.status = 'COMPLETED'
+    --    and fds.line_of_business in ('TNP','UberPOOL')
+        
+        and date(operational_date) >= DATE('{{xp_date}}')
+        and date(operational_date) <= DATE('{{xp_end_date}}')
+    
+    group by 1,2,3,4,5,6,7,8,9,10
+)
+
+, vc as (
+
+    select
+                 xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,completed_trips
+                ,ft_user_ct
+                ,gb
+        , sum(coalesce(vc_usd, vc_estimated_usd)) as vc
+        -- , min(fds.operational_date) as min_date_vc
+        -- , max(fds.operational_date) as max_date_vc
+
+    from trip_kpis xp  
+    left join secure_finance.fds_rides_vc fds
+    on xp.client_uuid = fds.client_uuid 
+    
+    and fds.status = 'COMPLETED'
+   --  and fds.line_of_business in ('TNP','UberPOOL')
+        
+        and date(operational_date) >= DATE('{{xp_date}}')
+        and date(operational_date) <= DATE('{{xp_end_date}}')
+
+    group by 1,2,3,4,5,6,7,8,9,10,11
+)
+
+, promo_spend as (
+
+    select 
+    
+                 b.campaign_name
+                ,b.cohort
+                ,b.tag_name
+                ,b.country_id
+                ,b.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,completed_trips
+                ,ft_user_ct
+                ,gb
+                ,vc
+      --  , promotion_category
+      --  , count(trip_uuid) as promo_trips  --- don't calculate trips data from here
+        , sum(amount_used_usd) as promo_spend
+        -- , max(t.begintrip_timestamp_local) as max_date_spend
+        -- , min(t.begintrip_timestamp_local) as min_date_spend
+    
+    from vc b 
+       left join dwh.fact_trip t  on b.client_uuid = t.client_uuid 
+        and t.status = 'completed'
+        and date(t.datestr) >= date('{{xp_date}}') 
+        and date(t.datestr) <= date('{{xp_end_date}}')
+        
+        left join dwh.fact_promo_redeem fpr on fpr.client_uuid = t.client_uuid and t.uuid = fpr.trip_uuid
+        and date(fpr.datestr) >= date('{{xp_date}}') 
+        and date(fpr.datestr) <= date('{{xp_end_date}}')
+        
+        left join dwh.dim_promotion dp on dp.promotion_code_uuid = fpr.promotion_code_uuid 
+        and date(begintrip_timestamp_local) >= date('{{xp_date}}')
+        and date(begintrip_timestamp_local) < date('{{xp_end_date}}') 
+        and dp.promotion_code in ('AUE2RT1' , 'NZE2RT1' , 'AUE2RT2', 'NZE2RT2', 'AUE2RT3', 'NZE2RT3')
+    
+    group by 1,2,3,4,5,6,7,8,9,10,11,12
+   )
+  
+
+,uber_pass as (
+
+    with cohort_pass as
+        (  select
+                 xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,completed_trips
+                ,ft_user_ct
+                ,gb
+                ,vc
+                ,promo_spend
+          --  , MIN(xp.treatment_group_key) as treatment_group_key
+            -- , MIN(xp.begin_effective_timestamp) as begin_effective_timestamp
+          --  ,  MIN(first_trip_request_timestamp) as first_trip_request_timestamp
+            , CASE WHEN COUNT(DISTINCT s.msg.passuuid) > 0 THEN TRUE ELSE FALSE END as is_pass_purchased
+        from
+           promo_spend xp
+        LEFT JOIN
+            rawdata.kafka_hp_multipass_pass_purchases_nodedup s
+            ON xp.client_uuid=s.msg.rideruuid
+            AND s.msg.purchasesuccess = TRUE
+            AND s.msg.offertype = 'UberPassOffer'
+        --  AND s.msg.appname = 'client'  ---  commented to include purchase on both apps
+
+            -- AND DATE_PARSE(REPLACE(REPLACE(s.msg.purchasetimestamp, 'T', ' '), 'Z', ''), '%Y-%m-%d %H:%i:%s') >= xp.begin_effective_timestamp 
+            -- AND DATE_PARSE(REPLACE(REPLACE(s.msg.purchasetimestamp, 'T', ' '), 'Z', ''), '%Y-%m-%d %H:%i:%s') < xp.begin_effective_timestamp + INTERVAL '28' DAY
+
+            AND s.datestr BETWEEN '{{xp_date}}' AND '{{xp_end_date}}'
+        GROUP BY
+            1,2,3,4,5,6,7,8,9,10,11,12,13
+        )
+
+        SELECT
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,completed_trips
+                ,ft_user_ct
+                ,gb
+                ,vc
+                ,promo_spend
+              --  , COUNT(1) as xp_cohort_user_ct
+                , SUM(CASE WHEN is_pass_purchased THEN 1 ELSE 0 END) as pass_purchased_user_ct
+               
+        from
+                cohort_pass as xp
+        GROUP BY
+                1,2,3,4,5,6,7,8,9,10,11,12,13
+    )
+
+  
+, expt_metrics as 
+
+     (          
+      select 
+                 xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,xp.quarter_freq
+                ,xp.lifetime_freq
+                ,xp.member
+    --    ,xp.users as cohort_users
+
+        , (case when xp.completed_trips >= 1 then 1 else 0 end) as riders 
+        , coalesce(xp.completed_trips,0)completed_trips
+
+        , xp.ft_user_ct
+        , coalesce(xp.gb,0)gb
+        , coalesce(xp.vc,0) as vc_gb
+        , coalesce(xp.promo_spend,0)promo_spend
+        , xp.pass_purchased_user_ct
+
+       from uber_pass as xp
+
+    --    left join rides_trips as rt 
+    --    on xp.client_uuid = rt.client_uuid and xp.campaign_name = rt.campaign_name and xp.cohort = rt.cohort  and xp.country_id = rt.country_id
+
+    --    left join rides_first_trips rft 
+    --    on xp.client_uuid = rt.client_uuid and xp.campaign_name = rft.campaign_name and xp.cohort = rft.cohort  and xp.country_id = rft.country_id
+
+    --    left join trip_kpis as tk 
+    --    on xp.client_uuid = rt.client_uuid and xp.campaign_name = tk.campaign_name and xp.cohort = tk.cohort  and xp.country_id = tk.country_id
+
+    --    left join vc as vc 
+    --    on xp.client_uuid = rt.client_uuid and xp.campaign_name = vc.campaign_name and xp.cohort = vc.cohort  and xp.country_id = vc.country_id
+
+    --    left join promo_spend as ps 
+    --    on xp.client_uuid = rt.client_uuid and xp.campaign_name = ps.campaign_name and xp.cohort = ps.cohort  and xp.country_id = ps.country_id
+
+    --    left join uber_pass as up
+    --    on xp.client_uuid = rt.client_uuid and xp.campaign_name = up.campaign_name and xp.cohort = up.cohort  and xp.country_id = up.country_id
+
+      )
+
+   select * from expt_metrics 
+
+ 
+-- 934531
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- Aggregated code  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , '1 all cohorts' as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4,5
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , quarter_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4,5
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , lifetime_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4,5
+
+    )
+
+ ,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , member as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(riders)riders
+      , 1*sum(riders) / count(distinct client_uuid) as avg_riders
+      , variance(riders)var_riders 
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+    --   , sum(ft_user_ct)ft_user_ct
+    --   , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+    --   , variance(ft_user_ct)var_ft_user_ct
+
+      , count(distinct case when ft_user_ct > 0 then client_uuid end )ft_user_ct
+      , 1*count(distinct case when ft_user_ct > 0 then client_uuid end ) / count(distinct client_uuid) as avg_ft_user_ct
+    --  , variance(count(distinct case when ft_user_ct > 0 then client_uuid end ))var_ft_user_ct
+
+      , sum(gb)gb
+      , 1*sum(gb) / count(distinct client_uuid) as avg_gb
+      , variance(gb)var_gb
+
+      , sum(vc_gb)vc_gb
+      , 1*sum(vc_gb) / count(distinct client_uuid) as avg_vc_gb
+      , variance(vc_gb)var_vc_gb
+
+      , sum(promo_spend)promo_spend
+      , 1*sum(promo_spend) / count(distinct client_uuid) as avg_promo_spend
+      , variance(promo_spend)var_promo_spend
+
+      , sum(pass_purchased_user_ct)pass_purchased_user_ct 
+
+
+      from india_growth.anz_xp_res_v3 
+      group by 1,2,3,4,5
+
+    )   
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- --------------------
+-- --- Users base for different cohorts (treatments vs control )
+-- ----------------------
+-- with xp_users as (
+--     select 
+--          '{{campaign_name}}' as campaign_name
+--         ,name as tag_name 
+--         ,dy.country_id
+--         ,case
+--             when name in ('{{treatment_tag1}}') then 'treatment1'
+--             when name in ('{{treatment_tag2}}') then 'treatment2'
+--             when name in ('{{treatment_tag3}}') then 'treatment3'
+--             when name in ('{{control_tag}}') then 'control'
+--          end as cohort 
+--         ,tags.user_uuid as client_uuid
+--         from raw_etl_data.api_user_tags  as tags
+--         join dwh.dim_eater dc on tags.user_uuid = dc.eater_uuid   --- referenced freq city id to map to country
+--         join dwh.dim_city dy on dc.primary_city_id = dy.city_id
+--         where 1=1 
+
+--         and name in ('{{control_tag}}' , '{{treatment_tag1}}', '{{treatment_tag2}}' , '{{treatment_tag3}}')
+--         and deleted_at is null
+--         and dy.country_id IN (10,126)
+--      )
+
+-- -- --- user base split--
+-- --     select treatment_group_key , count(distinct randomization_unit_id) user
+-- --     from xp_users
+-- --     group by 1
+
+-- --------------------
+-- ---  XP base for the campaign 
+-- ----------------------
+
+-- ,xp_base as (
+--         select 
+--          xp.campaign_name
+--         ,xp.cohort
+--         ,xp.tag_name
+--         ,xp.country_id
+--         ,client_uuid
+--       --  ,count(distinct client_uuid) as users
+
+--         from  xp_users as xp
+--          group by 1,2,3,4,5
+--        )
+
+
+create table india_growth.anz_xp_ssn_v1 as 
+
+--------------------
+--- rider sessions for different cohorts (treatments vs control )
+----------------------
+
+with sessions_rider AS (
+     SELECT 
+        campaign_name
+        ,cohort
+        ,tag_name
+        ,country_id
+        ,client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+        ,COUNT(DISTINCT CASE WHEN to_state.vvid_info.selected = TRUE
+            OR to_state.vvid_info.eta.last IS NOT NULL
+            OR to_state.vvid_info.zero_observed = TRUE
+            OR to_state.pd_screen_tag = 'InlineActionSheet' THEN session_id END) AS shopping_sessions
+
+     --   COUNT(DISTINCT CASE WHEN to_state.name = 'REQUEST_RIDE' THEN session_id END) AS requesting_sessions
+
+    FROM marketplace_data.rider_sessions s
+    join india_growth.anz_xp_base_v2 xp 
+     on s.rider_uuid = xp.client_uuid 
+    
+    where date(s.datestr) BETWEEN date('{{xp_date}}') and date('{{xp_end_date}}')
+    
+    GROUP BY 1,2,3,4,5,6,7,8
+)
+
+--------------------
+--- rider requests for different cohorts (treatments vs control )
+----------------------
+
+,requests_rider as (
+    SELECT 
+        campaign_name
+        ,cohort
+        ,tag_name
+        ,country_id
+        ,xp.client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+        , count(distinct uuid) as requests
+        , count(distinct case when status = 'completed' then uuid end) as completed_rqsts
+        
+    FROM dwh.fact_trip ft
+    join india_growth.anz_xp_base_v2 xp 
+     on ft.client_uuid = xp.client_uuid 
+    
+    -- INNER JOIN
+    -- riders su
+    -- ON su.client_uuid = ft.client_uuid   
+
+    where DATE(ft.datestr) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}' 
+    AND ft.marketplace='personal_transport' 
+    AND status != 'fare_split'
+    GROUP BY 1,2,3,4,5,6,7,8
+
+     )
+
+
+--------------------
+--- combining all metrics for different cohorts (treatments vs control )
+----------------------
+
+,expt_metrics_2 as 
+     (          
+      select 
+         xp.campaign_name
+        ,xp.cohort
+        ,xp.tag_name
+        ,xp.country_id 
+        ,xp.client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+    --    ,xp.users as cohort_users
+        
+        , coalesce(sr.shopping_sessions,0)shopping_sessions
+        , coalesce(rr.requests,0)requests
+        , coalesce(rr.completed_rqsts,0)completed_sessions
+    --    , coalesce(rr.requests / sr.shopping_sessions ,0) r_s_ratio
+
+        from india_growth.anz_xp_base_v2 as xp
+
+        left join sessions_rider as sr
+       on xp.client_uuid = sr.client_uuid and xp.campaign_name = sr.campaign_name and xp.cohort = sr.cohort  and xp.country_id = sr.country_id
+
+       left join requests_rider as rr
+       on xp.client_uuid = rr.client_uuid and xp.campaign_name = rr.campaign_name and xp.cohort = rr.cohort  and xp.country_id = rr.country_id
+
+      )
+
+    select * from expt_metrics_2 
+
+
+--934531
+
+-- ,agg_2 as
+--     (        
+--      select 
+      
+--       campaign_name
+--       , cohort
+--       , tag_name
+--       , country_id
+
+--       , sum(shopping_sessions)shopping_sessions
+--       , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+--       , variance(shopping_sessions)var_shopping_sessions
+
+--       , sum(requests)requests
+--       , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+--       , variance(requests)var_requests
+
+--       , sum(completed_sessions)completed_sessions
+
+--       , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+--       , variance(r_s_ratio)var_r_s_ratio
+
+--       from expt_metrics_2 
+--       group by 1,2,3,4
+--     )
+
+--     select * from agg_2 
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- Aggregated code  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , '1 all cohorts' as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4,5
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , quarter_freq as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4,5
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , lifetime_freq as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4,5
+
+    )
+
+,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , member as segment
+
+      , sum(shopping_sessions)shopping_sessions
+      , 1*sum(shopping_sessions) / count(distinct client_uuid) as avg_shopping_sessions
+      , variance(shopping_sessions)var_shopping_sessions
+
+      , sum(requests)requests
+      , 1*sum(requests) / count(distinct client_uuid) as avg_requests
+      , variance(requests)var_requests
+
+      , sum(completed_sessions)completed_sessions
+      , 1*sum(completed_sessions) / count(distinct client_uuid) as avg_completed_sessions
+
+    --   , 1*sum(r_s_ratio) / count(distinct client_uuid) as avg_r_s_ratio
+    --   , variance(r_s_ratio)var_r_s_ratio
+
+      from india_growth.anz_xp_ssn_v1 
+      group by 1,2,3,4,5
+
+    )   
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- Eats GB and trips metrics --------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------
+
+--------------------
+--- Users base for different cohorts (treatments vs control )
+----------------------
+
+india_growth.anz_xp_base_v2
+
+--------------------
+---  Eats GB for the campaign 
+-- https://querybuilder-ea-phx2.uberinternal.com/r/dZ0FmilCr/run/evBCb0OYj/
+-- https://querybuilder-ea-phx2.uberinternal.com/r/cdyQLEz6Z/run/o4w2Kp9ox 
+----------------------
+
+-- , fds as (
+
+--     select
+--         xp.campaign_name
+--         ,xp.cohort
+--         ,xp.tag_name
+--         ,xp.country_id
+
+--         -- , sum(coalesce(net_billings_usd, 0)) as net_billings_usd
+--         , sum(case when line_of_business = 'UberEATS' then coalesce(gross_bookings_usd, 0) end) as gb_eats
+--         , sum(case when line_of_business = 'UberGROCERY' then coalesce(gross_bookings_usd, 0) end) as gb_grocery
+--         , sum(case when line_of_business = 'POSTMATES' then coalesce(gross_bookings_usd, 0) end) as gb_postmates
+--         -- , sum(coalesce(net_inflows_usd, 0)) as net_inflows_usd
+
+--         from 
+--             secure_finance.fds_workflow_eats_op_dt as eat
+--             join xp_users as xp on eat.eater_uuid = xp.client_uuid
+
+--         and  operational_date >=  TO_ISO8601(FROM_ISO8601_DATE('{{xp_date}}') ) 
+--         and  operational_date <=  TO_ISO8601(FROM_ISO8601_DATE('{{xp_end_date}}') )    
+--         and  eat.status['delivery_status'] = 'completed'  and eat.status['order_status']= 'completed'
+
+--         group by 1,2,3,4
+--         )
+
+--------------------
+--- eaters trips n GB for different verticals (treatments vs control )
+----------------------
+
+create table india_growth.anz_xp_eats_v1 as 
+
+with trips_n_GB as 
+        (
+        select
+            xp.campaign_name
+            ,xp.cohort
+            ,xp.tag_name
+            ,xp.country_id
+            ,xp.client_uuid
+             ,xp.quarter_freq
+             ,xp.lifetime_freq
+             ,xp.member
+
+           -- ,count(distinct xp.client_uuid) as eaters
+
+            ,count(distinct fe.workflow_uuid) as total_completed_trips
+            ,count(distinct case when dm.merchant_type_analytics in ('MERCHANT_TYPE_UNKNOWN',
+                                                                        'MERCHANT_TYPE_RESTAURANT',
+                                                                          'MERCHANT_TYPE_SPECIALTY_FOOD' ) then fe.workflow_uuid end ) as eats_trips
+            
+            -- ,count(distinct case when dm.merchant_type_analytics in ('MERCHANT_TYPE_LIQUOR' ) then fe.workflow_uuid end ) as liquor_trips
+
+            ,count(distinct case when dm.merchant_type_analytics in ('MERCHANT_TYPE_RETAIL','MERCHANT_TYPE_ESSENTIALS',
+                                                                      'MERCHANT_TYPE_GROCERY', 'MERCHANT_TYPE_LIQUOR'
+                                                                         ) then fe.workflow_uuid end ) as grocery_liqor_trips
+
+            ,sum( case when dm.merchant_type_analytics in ('MERCHANT_TYPE_UNKNOWN',
+                                                                        'MERCHANT_TYPE_RESTAURANT',
+                                                                          'MERCHANT_TYPE_SPECIALTY_FOOD' ) then coalesce(gross_bookings_usd, 0) end ) as eats_gb
+            
+            -- ,sum(  case when dm.merchant_type_analytics in ('MERCHANT_TYPE_LIQUOR' ) then coalesce(gross_bookings_usd, 0) end ) as liquor_gb
+
+            ,sum(  case when dm.merchant_type_analytics in ('MERCHANT_TYPE_RETAIL','MERCHANT_TYPE_ESSENTIALS',
+                                                                      'MERCHANT_TYPE_GROCERY', 'MERCHANT_TYPE_LIQUOR'
+                                                                         ) then coalesce(gross_bookings_usd, 0) end ) as grocery_liqor_gb
+
+        from
+           india_growth.anz_xp_base_v2 as xp 
+            left join eds.fact_eats_trip fe on fe.client_uuid = xp.client_uuid
+            and datestr >= '{{xp_date}}' and datestr <= '{{xp_end_date}}' 
+            and date(fe.eater_request_timestamp_utc) >= date ('{{xp_date}}')
+            and is_completed = true
+
+          JOIN eds.dim_merchant dm ON fe.restaurant_uuid = dm.uuid   --- to get eats and other verticals 
+           and is_completed = true
+         
+         JOIN secure_finance.fds_workflow_eats_op_dt fdse
+          ON fe.workflow_uuid = fdse.workflow_uuid
+        --   and  operational_date >=  TO_ISO8601(FROM_ISO8601_DATE('{{xp_date}}') ) 
+        --   and  operational_date <=  TO_ISO8601(FROM_ISO8601_DATE('{{xp_end_date}}') )
+
+          AND DATE(fdse.operational_date) >= DATE('{{xp_date}}')
+            AND DATE(fdse.operational_date) <= DATE('{{xp_end_date}}')
+
+        group by 1,2,3,4,5,6,7,8
+        )
+
+
+--------------------
+--- eaters firsts for different cohorts (treatments vs control )
+----------------------
+
+, eats_first_trips as 
+        (
+         
+         select
+            xp.campaign_name
+            ,xp.cohort
+            ,xp.tag_name
+            ,xp.country_id
+            ,xp.client_uuid
+             ,xp.quarter_freq
+             ,xp.lifetime_freq
+              ,xp.member
+            ,count(distinct case when ae.eater_uuid is null then fe.client_uuid end) as ft_user_ct
+
+        from
+           india_growth.anz_xp_base_v2 as xp  
+           left join eds.fact_eats_trip fe on fe.client_uuid = xp.client_uuid
+        and 
+            datestr >= '{{xp_date}}' 
+            and datestr <= '{{xp_end_date}}' 
+            and date(fe.eater_request_timestamp_utc) >= date ('{{xp_date}}')
+            --  Date(datestr) >= Date(xp.begin_effective_timestamp)
+            and is_completed = true
+
+          left join dwh.analytics_eater ae 
+             on xp.client_uuid = ae.eater_uuid 
+             and datestr >= '{{xp_date}}' 
+             and datestr <= '{{xp_end_date}}' 
+             and date(first_eats_trip_request_timestamp) <= date ('{{xp_date}}') 
+
+            -- where ae.eater_uuid is null 
+
+            group by 1,2,3,4,5,6,7,8
+        )
+
+ --------------------
+--- eater session and requests for different cohorts (treatments vs control )
+----------------------
+
+,eater_ssn_N_rqsts as(
+    select 
+    xp.campaign_name
+    ,xp.cohort
+    ,xp.tag_name
+    ,xp.country_id
+    ,xp.client_uuid
+    ,xp.quarter_freq
+    ,xp.lifetime_freq
+    ,xp.member
+    , count(distinct case when element_at(event_map, 'request') is not null
+        then session_uuid end) as session_with_requests
+
+    , count(distinct session_uuid) as sessions
+
+    from india_growth.anz_xp_base_v2 as xp 
+    left join  eds.fact_eater_app_session as fae
+    on fae.user_uuid = xp.client_uuid
+    and datestr between '{{xp_date}}' and '{{xp_end_date}}' 
+        and device.os in ('ios', 'android')
+    -- Logged in users only
+    and user_uuid is not null
+    and user_uuid != ''
+    -- 'Valid' sessions only
+    -- Based on our intuitive definition of what a valid session means
+    -- This definition might change as we get a clearer understanding of 
+    -- what constitutes a valid session and how to track that
+    and (element_at(event_map, 'view_marketplace') is not null
+        or element_at(event_map, 'view_store') is not null
+        or element_at(event_map, 'search') is not null
+        or element_at(event_map, 'view_search') is not null
+        or element_at(event_map, 'view_store_item') is not null
+        or element_at(event_map, 'view_checkout') is not null
+        or element_at(event_map, 'add_store_item_to_cart') is not null
+        or element_at(event_map, 'request') is not null
+        or element_at(event_map, 'succeed_order_estimate') is not null
+        or element_at(event_map, 'succeed_request') is not null
+        )
+        group by 1,2,3,4,5,6,7,8
+    )       
+
+--------------------
+--- eater completed session for different cohorts (treatments vs control )
+----------------------
+
+,eater_cmpltd_app as(
+    select 
+    xp.campaign_name
+    ,xp.cohort
+    ,xp.tag_name
+    ,xp.country_id
+    ,xp.client_uuid
+     ,xp.quarter_freq
+    ,xp.lifetime_freq
+    ,xp.member
+    , count(distinct trip.session_uuid) as compltd_ssn_eats
+
+    from 
+      india_growth.anz_xp_base_v2 as xp  
+      left join 
+        (select distinct  
+            device.os as device_os
+            , user_uuid
+            , session_uuid 
+            , workflow_uuid
+        from eds.fact_eater_app_session
+        CROSS JOIN UNNEST(workflow_uuids) AS t (workflow_uuid)
+        where 1=1 
+            and datestr between '{{xp_date}}' and '{{xp_end_date}}'
+            and device.os in ('ios', 'android') 
+          ) as app
+        on app.user_uuid = xp.client_uuid 
+
+     join eds.fact_eats_trip as trip
+     on app.workflow_uuid = trip.workflow_uuid
+     and app.user_uuid = trip.client_uuid
+     and is_completed = true  -- if both order + delivery gets completed
+     and trip.datestr between '{{xp_date}}' and '{{xp_end_date}}' 
+    -- Logged in users only
+    and user_uuid is not null
+    and user_uuid != ''
+
+        group by 1,2,3,4,5,6,7,8
+    )      
+
+--------------------
+--- combining all metrics for different cohorts (treatments vs control )
+----------------------
+
+, expt_metrics_eats as 
+
+     (         
+      select 
+         xp.campaign_name
+        , xp.cohort
+        , xp.tag_name
+        , xp.country_id
+        , xp.client_uuid
+        , xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+
+     --   , xp.users as cohort_users
+        , (case when rt.total_completed_trips >= 1 then 1 else 0 end) as eaters 
+        , coalesce(rt.total_completed_trips,0)completed_trips
+
+        , coalesce(rt.eats_trips,0)eats_trips
+        , coalesce(rt.grocery_liqor_trips,0)grocery_liquor_trips
+
+        , coalesce(rt.eats_gb,0)eats_gb
+        , coalesce(rt.grocery_liqor_gb,0)grocery_liquor_gb
+
+        , eft.ft_user_ct
+        
+        , coalesce(ssn.session_with_requests,0)requests
+        , coalesce(ssn.sessions,0)sessions
+        , coalesce(cmpl.compltd_ssn_eats,0)compltd_ssn_eats
+    --    , coalesce(ssn.session_with_requests/ssn.sessions ,0)r_s_eats
+
+       from  india_growth.anz_xp_base_v2 as xp 
+
+       left join trips_n_GB as rt 
+       on xp.client_uuid = rt.client_uuid and xp.campaign_name = rt.campaign_name and xp.cohort = rt.cohort and xp.country_id = rt.country_id
+
+       left join eats_first_trips eft 
+       on xp.client_uuid = eft.client_uuid and xp.campaign_name = eft.campaign_name and xp.cohort = eft.cohort and xp.country_id = eft.country_id
+
+    --    left join fds as fds 
+    --    on xp.campaign_name = fds.campaign_name and xp.cohort = fds.cohort and xp.country_id = sr.country_id
+
+       left join eater_ssn_N_rqsts as ssn
+       on xp.client_uuid = ssn.client_uuid and xp.campaign_name = ssn.campaign_name and xp.cohort = ssn.cohort and xp.country_id = ssn.country_id
+
+       left join eater_cmpltd_app as cmpl 
+       on xp.client_uuid = cmpl.client_uuid and xp.campaign_name = cmpl.campaign_name and xp.cohort = cmpl.cohort and xp.country_id = cmpl.country_id
+
+     )
+   
+   select * from expt_metrics_eats
+
+
+ --934531   
+
+ with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , '1 all cohorts' as segment
+
+       , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4,5
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , quarter_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4,5
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , lifetime_freq as segment
+
+       , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4,5
+
+    )
+
+ ,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+      , country_id
+      , member as segment
+
+       , count(distinct client_uuid) as cohort_users
+
+      , sum(eaters)eaters
+      , 1*sum(eaters) / count(distinct client_uuid) as avg_eaters
+      , variance(eaters)var_eaters
+
+      , sum(completed_trips)completed_trips
+      , 1*sum(completed_trips) / count(distinct client_uuid) as avg_completed_trips
+      , variance(completed_trips)var_completed_trips
+
+      , sum(ft_user_ct)ft_user_ct
+      , 1*sum(ft_user_ct) / count(distinct client_uuid) as avg_ft_user_ct
+      , variance(ft_user_ct)var_ft_user_ct
+
+      , sum(eats_gb)eats_gb
+      , 1*sum(eats_gb) / count(distinct client_uuid) as avg_eats_gb
+      , variance(eats_gb)var_eats_gb
+
+      , sum(grocery_liquor_gb)grocery_liquor_gb
+      , 1*sum(grocery_liquor_gb) / count(distinct client_uuid) as avg_grocery_liquor_gb
+      , variance(grocery_liquor_gb)var_grocery_liquor_gb
+
+      , sum(eats_trips)eats_trips
+      , 1*sum(eats_trips) / count(distinct client_uuid) as avg_eats_trips
+      , variance(eats_trips)var_eats_trips
+
+      , sum(grocery_liquor_trips)grocery_liquor_trips
+      , 1*sum(grocery_liquor_trips) / count(distinct client_uuid) as avg_grocery_liquor_trips
+      , variance(grocery_liquor_trips)var_grocery_liquor_trips
+
+      , sum(requests)requests
+      , variance(grocery_liquor_trips)var_requests
+
+      , sum(sessions)sessions
+      , variance(sessions)var_sessions
+      
+      , sum(compltd_ssn_eats)compltd_ssn_eats 
+      , variance(compltd_ssn_eats)var_compltd_ssn_eats
+
+      from india_growth.anz_xp_eats_v1
+      group by 1,2,3,4,5
+
+    )
+
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
+
+
+-------------------------------- correction in FT user code -----------------------------------------------------
+
+ select merchant_type_analytics, count(distinct case when ft_user_ct > 0 then client_uuid end )user
+ 
+ from 
+   (
+  select
+            xp.campaign_name
+            ,xp.cohort
+            ,xp.tag_name
+            ,xp.country_id
+            ,xp.client_uuid
+             ,xp.quarter_freq
+             ,xp.lifetime_freq
+              ,xp.member
+              ,merchant_type_analytics
+            ,count(distinct case when ae.eater_uuid is null and fe.workflow_uuid is not null then fe.client_uuid end) as ft_user_ct
+
+        from
+           india_growth.anz_xp_base_v2 as xp  
+           left join eds.fact_eats_trip fe on fe.client_uuid = xp.client_uuid
+        and 
+            datestr >= '{{xp_date}}' 
+            and datestr <= '{{xp_end_date}}' 
+            and date(fe.eater_request_timestamp_utc) >= date ('{{xp_date}}')
+            --  Date(datestr) >= Date(xp.begin_effective_timestamp)
+            and is_completed = true
+            
+          JOIN eds.dim_merchant dm ON fe.restaurant_uuid = dm.uuid   --- to get eats and other verticals 
+           and is_completed = true
+
+          left join dwh.analytics_eater ae 
+             on xp.client_uuid = ae.eater_uuid 
+             and date(first_eats_trip_request_timestamp) < date ('{{xp_date}}') 
+
+            -- where ae.eater_uuid is null 
+
+            group by 1,2,3,4,5,6,7,8,9
+            
+      )g 
+      
+      where ft_user_ct > 0
+      group by 1
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------
+------------- Combining rides GB and Trips with rides Session and Eats session and GB data for T test  -------------
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+india_growth.anz_xp_res_v3   -- 934531
+india_growth.anz_xp_ssn_v1   -- 934531
+india_growth.anz_xp_eats_v1  -- 934531
+
+
+
+create table india_growth.AnZ_Xp_overall_metrics as 
+select  a.campaign_name
+       , a.cohort
+       , a.tag_name
+       , a.country_id
+       , a.client_uuid
+       , a.quarter_freq
+       , a.lifetime_freq
+       , a.member
+       , riders
+       , a.completed_trips
+       , (case when a.ft_user_ct > 0 then 1 else 0 end) as ft_user_ct
+       , gb
+       , vc_gb
+       , promo_spend
+       , (gb - promo_spend)adjusted_gb
+       , pass_purchased_user_ct
+       
+       , b.shopping_sessions
+       , b.requests
+       , b.completed_sessions
+       
+       , (case when eats_trips >= 1 then 1 else 0 end) as eaters 
+       , eats_trips
+       , eats_gb
+       
+       , (case when grocery_liquor_trips >= 1 then 1 else 0 end) as active_delivery 
+       , grocery_liquor_trips
+       , grocery_liquor_gb
+       
+       , c.requests as eats_request
+       , c.sessions as eats_sessions
+       , compltd_ssn_eats as eats_completed_sessions
+
+
+from 
+india_growth.anz_xp_res_v3 as a 
+left join india_growth.anz_xp_ssn_v1 as b 
+ on a.client_uuid = b.client_uuid and a.cohort = b.cohort and a.country_id = b.country_id
+ 
+left join india_growth.anz_xp_eats_v1 as c
+on a.client_uuid = c.client_uuid and a.cohort = c.cohort and a.country_id = c.country_id
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- Retention chart (Timeseries ) --------------------------------------------
+-- https://querybuilder-ea.uberinternal.com/r/CsPAyDAkd/run/hpOsKMKol/edit
+------------------------------------------------------------------------------------------------------------------------------------
+
+
+--------------------
+--- Users base for different cohorts (treatments vs control )
+----------------------
+-- with xp_users as (
+--     select 
+--          '{{campaign_name}}' as campaign_name
+--         ,name as tag_name 
+--         ,dy.country_id
+--         ,case
+--             when name in ('{{treatment_tag1}}') then 'treatment1'
+--             when name in ('{{treatment_tag2}}') then 'treatment2'
+--             when name in ('{{treatment_tag3}}') then 'treatment3'
+--             when name in ('{{control_tag}}') then 'control'
+--          end as cohort 
+--         ,tags.user_uuid as client_uuid
+--         from raw_etl_data.api_user_tags  as tags
+--         join dwh.dim_eater dc on tags.user_uuid = dc.eater_uuid   --- referenced freq city id to map to country
+--         join dwh.dim_city dy on dc.primary_city_id = dy.city_id
+--         where 1=1 
+
+--         and name in ('{{control_tag}}' , '{{treatment_tag1}}', '{{treatment_tag2}}' , '{{treatment_tag3}}')
+--         and deleted_at is null
+--         and dy.country_id IN (10,126)
+--      )
+
+-- -- --- user base split--
+-- --     select treatment_group_key , count(distinct randomization_unit_id) user
+-- --     from xp_users
+-- --     group by 1
+
+-- --------------------
+-- ---  XP base for the campaign 
+-- ----------------------
+
+-- ,xp_base as (
+--         select 
+--          xp.campaign_name
+--         ,xp.cohort
+--         ,xp.tag_name
+--         ,xp.country_id
+--         ,xp.client_uuid
+
+--         from  xp_users as xp
+--          group by 1,2,3,4,5
+--        )
+
+##india_growth.anz_xp_base_v2
+
+--------------------
+---  First trip data for the campaign 
+----------------------
+
+with rides_first_trips as (
+      with abc as ( select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id 
+                ,xp.client_uuid
+                ,xp.quarter_freq
+                ,xp.lifetime_freq
+                ,xp.member
+                ,Date(min(ft.request_timestamp_utc))request_timestamp_utc
+        
+     from india_growth.anz_xp_base_v2 xp 
+      join dwh.fact_trip ft 
+        on ft.client_uuid = xp.client_uuid
+         and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')
+          
+        left join dwh.analytics_client as ac 
+             on xp.client_uuid = ac.user_uuid
+             and date(first_trip_request_timestamp) < date('{{xp_date}}')
+       
+        where ac.user_uuid is null        
+        group by 1,2,3,4,5,6,7,8
+
+        )
+
+      select 
+         a.*  ,case when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-01-27' then '1'
+                      when request_timestamp_utc >= Date '2022-01-28' and request_timestamp_utc <= Date '2022-02-03' then '2'
+                      when request_timestamp_utc >= Date '2022-02-04' and request_timestamp_utc <=Date '2022-02-10' then '3'
+                      when request_timestamp_utc >= Date '2022-02-11' and request_timestamp_utc <= Date '2022-02-17' then '4'
+                      when request_timestamp_utc >= Date '2022-02-18' and request_timestamp_utc <= Date '2022-02-24' then '5'
+                      when request_timestamp_utc >= Date '2022-02-25' and request_timestamp_utc <= Date '2022-03-03' then '6'
+                      end as FT_week
+
+         from abc   as a               
+       
+       )
+
+, rides_trips as (
+        select  xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                , xp.quarter_freq
+                ,xp.lifetime_freq
+                ,xp.member
+                ,case when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-01-27' then '1'
+                      when request_timestamp_utc >= Date '2022-01-28' and request_timestamp_utc <= Date '2022-02-03' then '2'
+                      when request_timestamp_utc >= Date '2022-02-04' and request_timestamp_utc <=Date '2022-02-10' then '3'
+                      when request_timestamp_utc >= Date '2022-02-11' and request_timestamp_utc <= Date '2022-02-17' then '4'
+                      when request_timestamp_utc >= Date '2022-02-18' and request_timestamp_utc <= Date '2022-02-24' then '5'
+                      when request_timestamp_utc >= Date '2022-02-25' and request_timestamp_utc <= Date '2022-03-03' then '6'
+                      end as Trips_week
+
+                ,count(ft.uuid) as completed_trips
+
+              from india_growth.anz_xp_base_v2 xp 
+               join dwh.fact_trip ft 
+                on ft.client_uuid = xp.client_uuid
+                
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date ('{{xp_date}}')
+                group by 1,2,3,4,5,6,7,8,9
+            )
+
+
+, trip_kpis as (
+
+    select 
+        xp.campaign_name
+        ,xp.cohort
+        ,xp.tag_name
+        ,xp.country_id
+        ,xp.client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+        ,case when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-01-27' then '1'
+                      when date(operational_date) >= Date '2022-01-28' and date(operational_date) <= Date '2022-02-03' then '2'
+                      when date(operational_date) >= Date '2022-02-04' and date(operational_date) <=Date '2022-02-10' then '3'
+                      when date(operational_date) >= Date '2022-02-11' and date(operational_date) <= Date '2022-02-17' then '4'
+                      when date(operational_date) >= Date '2022-02-18' and date(operational_date) <= Date '2022-02-24' then '5'
+                      when date(operational_date) >= Date '2022-02-25' and date(operational_date) <= Date '2022-03-03' then '6'            
+                      end as Trips_week
+
+        , sum(gross_bookings_usd ) as gb
+
+        -- , max(cast(operational_date as timestamp)) as max_date_trips
+        -- , min(cast(operational_date as timestamp)) as min_date_trips
+    
+    from secure_finance.fds_jobs_rides_op_dt fds 
+     join india_growth.anz_xp_base_v2 xp on xp.client_uuid = fds.client_uuid 
+
+    and fds.status = 'COMPLETED'
+    --    and fds.line_of_business in ('TNP','UberPOOL')
+        
+        and date(operational_date) >= DATE('{{xp_date}}')
+        and date(operational_date) <= DATE('{{xp_end_date}}')
+    
+    group by 1,2,3,4,5,6,7,8,9
+)
+
+
+
+,timeline as (
+
+       select ft.* , trips.Trips_week , trips.completed_trips, gb
+
+         from  rides_first_trips as ft 
+
+         left join rides_trips as trips
+           on ft.client_uuid = trips.client_uuid and ft.campaign_name = trips.campaign_name and ft.cohort = trips.cohort  
+             and ft.country_id = trips.country_id and trips.Trips_week >= FT_week
+        
+        join trip_kpis as kp
+          on trips.client_uuid = kp.client_uuid and trips.campaign_name = kp.campaign_name and trips.cohort = kp.cohort  
+             and trips.country_id = kp.country_id and trips.Trips_week = kp.Trips_week
+
+
+        ) 
+-- country level 
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,FT_week
+            ,trips_week
+            , '1 all cohorts' as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7
+
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,FT_week
+            ,trips_week
+            , quarter_freq as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7
+    
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,FT_week
+            ,trips_week
+            , lifetime_freq as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7
+      
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,FT_week
+            ,trips_week
+            , member as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7 
+    
+     union all
+-- overall level 
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,FT_week
+            ,trips_week
+            , '1 all cohorts' as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7
+
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,FT_week
+            ,trips_week
+            , quarter_freq as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7
+    
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,FT_week
+            ,trips_week
+            , lifetime_freq as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7
+      
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,FT_week
+            ,trips_week
+            , member as segment
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+        from  timeline   
+         group by 1,2,3,4,5,6,7 
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- Comms Funnel  --------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+----------------------
+---  comms sent and clicked Data for the campaign 
+--- sample code : https://querybuilder-ea.uberinternal.com/r/FeWYyJ8NL/edit
+----------------------
+
+with comm_base as (
+
+   select 
+     client_uuid
+    , xp.campaign_name
+    , xp.cohort
+    , xp.tag_name
+    , xp.country_id
+    , quarter_freq
+    , lifetime_freq
+    , member
+    , message_uuid
+    , content_name
+    , workflow_name
+    , medium
+    , ( case when medium = 'email' then 'Email' 
+             when medium = 'push' then 'Push'  
+             when medium = 'in_app' then 'Eats Billboard'  else 'Others' end
+         ) as comm_type
+
+    , SUM(count_sent) as sent
+    , SUM(CASE WHEN count_sent IN (0,1) THEN count_sent ELSE 1 END) as unique_sent
+
+    , SUM(count_delivered) as delivered 
+
+    , SUM(count_created) as created    -- only for in-app
+    , SUM(CASE WHEN count_created IN (0,1) THEN count_created ELSE 1 END) as unique_created -- only for in-app
+    
+    , SUM(count_impression) as impression  -- only for in-app
+    , SUM(CASE WHEN count_impression IN (0,1) THEN count_impression ELSE 1 END) as unique_impression  -- only for in-app
+
+    , SUM(count_open) as open
+    , SUM(CASE WHEN count_open IN (0,1) THEN count_open ELSE 1 END) as unique_open 
+
+    , SUM(count_click) as click
+    , SUM(CASE WHEN count_click IN (0,1) THEN count_click ELSE 1 END) as unique_click
+
+    , SUM(count_click_unsubscribe) as unsub
+
+    , SUM(count_click_unsubscribe) / (SUM(count_delivered)*1.0000) as unsub_rate
+
+     from india_growth.anz_xp_base_v2 as xp 
+     join dwh.agg_lifetime_comm_metrics alcm
+     on xp.client_uuid = alcm.to_user_uuid
+     and DATE(alcm.datestr) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}'
+     and workflow_name like '%global_anz_e2r_beanstalk_new-riders%'   --- use like function as workflow can be suffixed for different comms/push
+
+     group by 1,2,3,4,5,6,7,8,9,10,11,12
+
+
+     )
+
+
+----------------------
+---  comms clicks timestamp for the campaign 
+----------------------
+
+ , comm_click_ts as  (
+              select cs.* 
+                , fce.event_uuid
+                ,fce.event_details
+                ,fce.event_name
+                ,fce.event_value
+                ,fce.medium
+                ,fce.event_timestamp
+
+             from comm_base as cs 
+              join dwh.fact_comm_event as fce  
+                on fce.message_uuid = cs.message_uuid
+               and DATE(fce.datestr) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}'
+               and click >= 1
+               and event_name in ('click' , 'open')
+
+            )
+
+----------------------
+---  signups for the campaign 
+------ Only 27 is_rider = true  has done the sign up  -- skipping this part 
+
+-- ----------------------
+
+-- ,Signup as (
+--         SELECT
+--             xp.*
+--             -- ,count(case when dl.user_uuid is not null then 1 else 0 end) as signup_rider
+--             ,signup_timestamp
+
+--         FROM
+--         india_growth.anz_xp_base_v2 as xp
+--         JOIN
+--             dwh.dim_client dl
+--             ON xp.client_uuid = dl.user_uuid
+--             AND DATE(signup_timestamp) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}' 
+--         --  and signup_timestamp >= event_timestamp 
+--         --  AND not dl.is_uber_email
+--             AND (
+--                     (
+--                         -- dl.signup_form in (
+--                         --                     'android'
+--                         --                     , 'android_passwordless'
+--                         --                     , 'iphone'
+--                         --                     , 'iphone_passwordless'
+--                         --                 )
+--                         -- AND 
+--                         is_rider = TRUE
+--                     )
+--                 ) 
+--         GROUP BY
+--             1
+--         )
+
+
+----------------------
+---  Logins for the campaign 
+-- select 
+            
+--         distinct  element_at(value_map, 'flowType') flowType
+--         from  rider.fact_rider_app_event as fras
+--         where DATE(datestr) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}'   
+--          and element_at(value_map, 'flowType') is not null 
+   
+-- count is 1071 for below code 
+    --      select 
+    --          xp.*
+    --          ,from_unixtime((session_start_time_ms_client/1000),'UTC')session_start_time_ms_client
+    --          ,has_logged_in, onboarding_success_flowtype 
+    --        --  ,count(distinct client_uuid) cnt
+
+    --    from india_growth.anz_xp_base_v2 as xp 
+    --     join rider.fact_rider_app_event as fras
+    --      on xp.client_uuid = fras.rider_id 
+    --      AND DATE(datestr) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}'  
+    --      and element_at(value_map, 'flowType') in ('SIGN_IN', 'SIGN_UP', 'THIRD_PARTY_SIGN_IN', 'THIRD_PARTY_SIGN_UP') 
+
+
+
+----------------------
+
+-- ,loggedIn as  (
+--         -- group by 1,
+--         select 
+
+--          xp.*
+--          ,session_id
+
+--        from india_growth.anz_xp_base_v2 as xp 
+--         join rider.fact_rider_app_session as fras
+--          on xp.client_uuid = fras.client_uuid 
+--          AND DATE(datestr) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}'  
+--           and has_logged_in = True
+
+--          group by 1,2
+
+--         )
+
+---- rider sessions : fact_rider_app_session / fact_rider _app_event
+
+-- ,sessions_rider AS (
+--      SELECT 
+--         campaign_name
+--         ,cohort
+--         ,tag_name
+--         ,country_id
+--         ,client_uuid
+--         ,xp.quarter_freq
+--         ,xp.lifetime_freq
+--         ,xp.member
+--         ,comm_type 
+--         ,event_timestamp
+--      --   ,session_start_time
+--         ,from_unixtime((session_start_time_ms_client/1000),'UTC')session_start_time
+--         ,session_id
+--         ,COUNT(DISTINCT CASE WHEN to_state.vvid_info.selected = TRUE
+--             OR to_state.vvid_info.eta.last IS NOT NULL
+--             OR to_state.vvid_info.zero_observed = TRUE
+--             OR to_state.pd_screen_tag = 'InlineActionSheet' THEN session_id END) AS shopping_sessions
+
+--      --   COUNT(DISTINCT CASE WHEN to_state.name = 'REQUEST_RIDE' THEN session_id END) AS requesting_sessions
+
+--     FROM marketplace_data.rider_sessions s
+--     join comm_click_ts as xp 
+--      on s.rider_uuid = xp.client_uuid 
+    
+--     and date(s.datestr) BETWEEN date('{{xp_date}}') and date('{{xp_end_date}}')
+--     and event_timestamp <= cast(session_start_time as TIMESTAMP)
+
+--     GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12
+
+--     )
+
+,sessions_rider AS (
+     SELECT 
+        campaign_name
+        ,cohort
+        ,tag_name
+        ,country_id
+        ,xp.client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+        ,comm_type 
+        ,event_timestamp
+       -- ,session_start_time
+        ,from_unixtime((session_start_time_ms_client/1000),'UTC')session_start_time
+        ,session_id
+        ,COUNT(DISTINCT session_id ) AS shopping_sessions
+     --   COUNT(DISTINCT CASE WHEN to_state.name = 'REQUEST_RIDE' THEN session_id END) AS requesting_sessions
+
+    FROM rider.fact_rider_app_session s
+    join comm_click_ts as xp 
+     on s.client_uuid = xp.client_uuid 
+    
+    and date(s.datestr) BETWEEN date('{{xp_date}}') and date('{{xp_end_date}}')
+    and event_timestamp <= cast(from_unixtime((session_start_time_ms_client/1000),'UTC') as TIMESTAMP)
+
+    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12
+
+    )
+
+
+----------------------
+--- Last touch point (clicks) before signup for the campaign  t1, t2, t3 
+----------------------
+
+,last_touch_attrb as (
+ 
+        with last_ts as ( 
+                select client_uuid, session_id, max(event_timestamp)event_timestamp 
+                
+                from sessions_rider
+                 group by 1,2       
+
+              )
+
+          select ct.*
+           from last_ts as lt 
+            join sessions_rider  as ct
+             on lt.client_uuid = ct.client_uuid 
+             and lt.session_id = ct.session_id
+              and lt.event_timestamp = ct.event_timestamp 
+        )
+
+
+--------------------
+--- rider requests for different cohorts (treatments vs control )
+----------------------
+
+,requests_rider as (
+    SELECT 
+        campaign_name
+        ,cohort
+        ,tag_name
+        ,country_id
+        ,xp.client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+        ,comm_type
+        , count(uuid) as requests
+        , count(case when status = 'completed' then uuid end) as completed_rqsts
+        
+    FROM last_touch_attrb xp  
+    join dwh.fact_trip ft
+     on ft.client_uuid = xp.client_uuid 
+     and xp.session_id = ft.session_id 
+    
+    -- INNER JOIN
+    -- riders su
+    -- ON su.client_uuid = ft.client_uuid   
+
+    where DATE(ft.datestr) BETWEEN DATE '{{xp_date}}' AND DATE '{{xp_end_date}}' 
+    AND ft.marketplace='personal_transport' 
+    AND status != 'fare_split'
+    GROUP BY 1,2,3,4,5,6,7,8,9
+
+     )
+
+
+--------------------
+--- aggregate result for the campaign 
+----------------------
+
+
+,agg_clicks as 
+ ( 
+  select 
+     xp.campaign_name
+    , xp.cohort
+    , xp.tag_name
+    , xp.country_id
+    , quarter_freq
+    , lifetime_freq
+    , member
+    , comm_type
+
+    , SUM(sent) as sent
+    , SUM(unique_sent) as unique_sent
+
+    , SUM(delivered) as delivered 
+
+    , SUM(created) as created 
+    , SUM(unique_created) as unique_created 
+    
+    , SUM(impression) as impression 
+    , SUM(unique_impression) as unique_impression 
+
+    , SUM(open) as open
+    , SUM(unique_open) as unique_open 
+
+    , SUM(click) as click
+    , SUM(unique_click) as unique_click
+
+    , SUM(unsub) as unsub
+    , SUM(unsub) / (SUM(delivered)*1.0000) as unsub_rate
+
+
+    from comm_base  as xp
+     group by 1,2,3,4,5,6,7,8   
+
+    )
+
+,sessions_agg as 
+ (
+  select 
+    xp.campaign_name
+    , xp.cohort
+    , xp.tag_name
+    , xp.country_id
+    , quarter_freq
+    , lifetime_freq
+    , member
+    , comm_type
+    , sum(shopping_sessions)shopping_sessions 
+
+    from last_touch_attrb as xp
+    group by 1,2,3,4,5,6,7,8   
+      
+   )
+
+
+,requests_agg as 
+ (
+  select 
+    xp.campaign_name
+    , xp.cohort
+    , xp.tag_name
+    , xp.country_id
+    , quarter_freq
+    , lifetime_freq
+    , member
+    , comm_type
+    , sum(requests)requests 
+    , sum(completed_rqsts)completed_rqsts 
+
+    from requests_rider  as xp
+    group by 1,2,3,4,5,6,7,8 
+      
+  )
+
+
+ select   
+      a.* 
+     ,b.shopping_sessions
+     ,c.requests
+     ,c.completed_rqsts
+
+   from agg_clicks as a 
+    left join sessions_agg as b 
+     on a.country_id = b.country_id and a.cohort = b.cohort and a.quarter_freq = b.quarter_freq 
+      and a.lifetime_freq = b.lifetime_freq and a.member = b.member and a.comm_type = b.comm_type 
+
+    left join requests_agg as c
+     on a.country_id = c.country_id and a.cohort = c.cohort and a.quarter_freq = c.quarter_freq 
+      and a.lifetime_freq = c.lifetime_freq and a.member = c.member and a.comm_type = c.comm_type 
+
+
+  
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- T test specific metrics  --------------------------------------------
+
+
+-- Present in Python
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- Who are these X-platform users  --------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- Rides taken weekend or weekdays --------------------------------------------
+
+
+
+--------------------
+---  trip data for the campaign 
+----------------------
+
+        ,format_datetime(date(first_trip_request_timestamp), 'EEEE') as weekday
+        ,hour(first_trip_request_timestamp) as hour
+
+
+
+-- with rides_trips as (
+--         select  xp.campaign_name
+--                 ,xp.cohort
+--                 ,xp.tag_name
+--                 ,xp.country_id
+--                 ,xp.client_uuid
+--                 ,quarter_freq
+--                 ,lifetime_freq
+--                 ,member
+--                 ,count(ft.uuid) as completed_trips
+--              --   ,count(distinct xp.client_uuid) as riders
+
+--               from india_growth.anz_xp_base_v2 xp 
+--                left join dwh.fact_trip ft 
+--                 on ft.client_uuid = xp.client_uuid
+                
+--                 and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+--                 and ft.status = 'completed' 
+--                 AND ft.marketplace = 'personal_transport'
+--                 and date(ft.request_timestamp_utc) >= date ('{{xp_date}}')
+--                 group by 1,2,3,4,5,6,7,8
+--             )
+
+
+with rides_first_trips as (
+         select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                -- ,first_trip_request_timestamp
+                -- ,request_timestamp_local
+                ,format_datetime(date(request_timestamp_local), 'EEEE') as weekday
+                ,hour(request_timestamp_local) as hour
+                
+                -- ,sum(case when ft.client_uuid is not null and ac.user_uuid is null then 1 else 0 end) as ft_user_ct
+        
+     from india_growth.anz_xp_base_v2 xp         
+        left join dwh.analytics_client as ac 
+             on xp.client_uuid = ac.user_uuid
+            --  and date(first_trip_request_timestamp) < date('{{xp_date}}')
+
+          join dwh.fact_trip ft 
+          on ac.user_uuid = ft.client_uuid
+           and date(ft.datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')
+       
+        where date(first_trip_request_timestamp) >= date('{{xp_date}}')      
+        group by 1,2,3,4,5,6,7,8,9,10
+    
+
+        )
+
+    select 
+         campaign_name
+        , cohort
+        , tag_name
+        , country_id
+        , quarter_freq
+        , lifetime_freq
+        , member
+        ,weekday
+        ,hour
+        ,count(distinct client_uuid) as user
+
+        from rides_first_trips 
+        group by 1,2,3,4,5,6,7,8,9
+         ;
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- first trip timestamp of users not as FT  --------------------------------------------
+
+
+
+with rides_trips as (
+        select  xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,count(ft.uuid) as completed_trips
+             --   ,count(distinct xp.client_uuid) as riders
+
+              from india_growth.anz_xp_base_v2 xp 
+               left join dwh.fact_trip ft 
+                on ft.client_uuid = xp.client_uuid
+                
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date ('{{xp_date}}')
+                group by 1,2,3,4,5,6,7,8
+            )
+
+, rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,completed_trips
+
+                , sum(case when ft.client_uuid is not null and ac.user_uuid is null then 1 else 0 end) as ft_user_ct
+        
+     from rides_trips xp 
+      left join dwh.fact_trip ft 
+        on ft.client_uuid = xp.client_uuid
+         and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')
+          
+        left join dwh.analytics_client as ac 
+             on xp.client_uuid = ac.user_uuid
+             and date(first_trip_request_timestamp) < date('{{xp_date}}')
+       
+     --   where ac.user_uuid is null        
+        group by 1,2,3,4,5,6,7,8,9
+
+        )
+
+    select rt.* , 
+           rft.ft_user_ct ,
+           ac.first_trip_request_timestamp 
+
+      from rides_trips as rt 
+       left join rides_first_trips as rft 
+        on rt.client_uuid = rft.client_uuid 
+         
+
+      left join dwh.analytics_client as ac  
+       on rt.client_uuid = ac.user_uuid
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- Overall level code  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+create table india_growth.anz_xp_overall_v2
+ select a.* 
+        ,b.shopping_sessions
+        ,b.requests
+        ,b.completed_sessions
+
+        ,c.eaters
+        ,c.completed_trips as eats_completed_trips
+        ,c.eats_trips
+        ,c.grocery_liquor_trips
+        ,c.eats_gb
+        ,c.grocery_liquor_gb
+        ,c.requests as eats_requests
+        ,c.sessions as eats_sessions
+        ,c.compltd_ssn_eats as eats_completed_session
+
+  
+   from india_growth.anz_xp_res_v3 as a 
+   
+    left join india_growth.anz_xp_ssn_v1 as b 
+     on a.client_uuid = b.client_uuid and a.campaign_name = b.campaign_name and a.cohort = b.cohort  and a.country_id = b.country_id
+     
+     left join india_growth.anz_xp_eats_v1 as c 
+      on a.client_uuid = c.client_uuid and a.campaign_name = c.campaign_name and a.cohort = c.cohort  and a.country_id = c.country_id
+      
+-- 934531    
+     
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+---------------------------------------------- Aggregated code  ----------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+
+with all_cohorts as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+     -- , country_id
+      , '1 all cohorts' as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )
+
+ ,quarter_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , quarter_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )
+ 
+ ,lifetime_freq as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , lifetime_freq as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )
+
+ ,member as
+    (        
+     select 
+      
+       campaign_name
+      , cohort
+      , tag_name
+    --  , country_id
+      , member as segment
+
+      , count(distinct client_uuid) as cohort_users
+
+      , sum(gb + eats_gb + grocery_liquor_gb )overall_gb
+      , sum(completed_trips + eats_trips + grocery_liquor_trips )overall_trips
+      , sum(promo_spend)promo_spend
+
+      from india_growth.anz_xp_overall_v2 
+      group by 1,2,3,4
+
+    )   
+
+    select * from all_cohorts 
+    union all 
+    select * from quarter_freq 
+    union all
+    select * from lifetime_freq 
+    union all
+    select * from member 
+
+
+
+
+
+
+    
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------- 7,14,21,28 day window (Retention chart) (Timeseries ) --------------------------------------------
+-- https://querybuilder-ea.uberinternal.com/r/CsPAyDAkd/run/hpOsKMKol/edit
+------------------------------------------------------------------------------------------------------------------------------------
+
+--------------------
+--- Users base for different cohorts (treatments vs control )
+----------------------
+
+
+##india_growth.anz_xp_base_v2
+
+--------------------
+---  First trip data for the campaign 
+-- '2022-01-21' to '2022-03-03' 
+----------------------
+
+create table india_growth.anz_xp_7_14_21_cohort_v2 as 
+with rides_trips as (
+        select  xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                , xp.quarter_freq
+                ,xp.lifetime_freq
+                ,xp.member
+                ,case when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-01-27' then '1 7Days'
+                      when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-02-03' then '2 14Days'
+                      when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <=Date '2022-02-10' then '3 21Days'
+                      when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-02-17' then '4 28Days'
+                      when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-02-24' then '5 35Days'
+                      when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-03-03' then '6 42Days'
+                      end as Trips_week
+
+                ,count(ft.uuid) as completed_trips
+
+              from india_growth.anz_xp_base_v2 xp 
+               join dwh.fact_trip ft 
+                on ft.client_uuid = xp.client_uuid
+                
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date ('{{xp_date}}')
+                group by 1,2,3,4,5,6,7,8,9
+            )
+
+
+, rides_GB as (
+
+    select 
+        xp.campaign_name
+        ,xp.cohort
+        ,xp.tag_name
+        ,xp.country_id
+        ,xp.client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+        ,case when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-01-27' then '1 7Days'
+                      when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-02-03' then '2 14Days'
+                      when date(operational_date) >= Date '2022-01-21' and date(operational_date) <=Date '2022-02-10' then '3 21Days'
+                      when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-02-17' then '4 28Days'
+                      when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-02-24' then '5 35Days'
+                      when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-03-03' then '6 42Days'
+                      end as Trips_week
+
+        , sum(gross_bookings_usd ) as gb
+
+        -- , max(cast(operational_date as timestamp)) as max_date_trips
+        -- , min(cast(operational_date as timestamp)) as min_date_trips
+    
+    from secure_finance.fds_jobs_rides_op_dt fds 
+     join india_growth.anz_xp_base_v2 xp on xp.client_uuid = fds.client_uuid 
+
+    and fds.status = 'COMPLETED'
+    --    and fds.line_of_business in ('TNP','UberPOOL')
+        
+        and date(operational_date) >= DATE('{{xp_date}}')
+        and date(operational_date) <= DATE('{{xp_end_date}}')
+    
+    group by 1,2,3,4,5,6,7,8,9
+)
+
+
+,eats_trips_n_GB as 
+        (
+        select
+            xp.campaign_name
+            ,xp.cohort
+            ,xp.tag_name
+            ,xp.country_id
+            ,xp.client_uuid
+             ,xp.quarter_freq
+             ,xp.lifetime_freq
+             ,xp.member
+             ,case when date(fe.eater_request_timestamp_utc) >= Date '2022-01-21' and date(fe.eater_request_timestamp_utc) <= Date '2022-01-27' then '1 7Days'
+                      when date(fe.eater_request_timestamp_utc) >= Date '2022-01-21' and date(fe.eater_request_timestamp_utc) <= Date '2022-02-03' then '2 14Days'
+                      when date(fe.eater_request_timestamp_utc) >= Date '2022-01-21' and date(fe.eater_request_timestamp_utc) <=Date '2022-02-10' then '3 21Days'
+                      when date(fe.eater_request_timestamp_utc) >= Date '2022-01-21' and date(fe.eater_request_timestamp_utc) <= Date '2022-02-17' then '4 28Days'
+                      when date(fe.eater_request_timestamp_utc) >= Date '2022-01-21' and date(fe.eater_request_timestamp_utc) <= Date '2022-02-24' then '5 35Days'
+                      when date(fe.eater_request_timestamp_utc) >= Date '2022-01-21' and date(fe.eater_request_timestamp_utc) <= Date '2022-03-03' then '6 42Days'
+                      end as Trips_week
+       
+
+           -- ,count(distinct xp.client_uuid) as eaters
+
+            ,count(distinct fe.workflow_uuid) as total_completed_trips
+            ,count(distinct case when dm.merchant_type_analytics in ('MERCHANT_TYPE_UNKNOWN',
+                                                                        'MERCHANT_TYPE_RESTAURANT',
+                                                                          'MERCHANT_TYPE_SPECIALTY_FOOD' ) then fe.workflow_uuid end ) as eats_trips
+            
+            -- ,count(distinct case when dm.merchant_type_analytics in ('MERCHANT_TYPE_LIQUOR' ) then fe.workflow_uuid end ) as liquor_trips
+
+            ,count(distinct case when dm.merchant_type_analytics in ('MERCHANT_TYPE_RETAIL','MERCHANT_TYPE_ESSENTIALS',
+                                                                      'MERCHANT_TYPE_GROCERY', 'MERCHANT_TYPE_LIQUOR'
+                                                                         ) then fe.workflow_uuid end ) as grocery_liqor_trips
+
+            ,sum( case when dm.merchant_type_analytics in ('MERCHANT_TYPE_UNKNOWN',
+                                                                        'MERCHANT_TYPE_RESTAURANT',
+                                                                          'MERCHANT_TYPE_SPECIALTY_FOOD' ) then coalesce(gross_bookings_usd, 0) end ) as eats_gb
+            
+            -- ,sum(  case when dm.merchant_type_analytics in ('MERCHANT_TYPE_LIQUOR' ) then coalesce(gross_bookings_usd, 0) end ) as liquor_gb
+
+            ,sum(  case when dm.merchant_type_analytics in ('MERCHANT_TYPE_RETAIL','MERCHANT_TYPE_ESSENTIALS',
+                                                                      'MERCHANT_TYPE_GROCERY', 'MERCHANT_TYPE_LIQUOR'
+                                                                         ) then coalesce(gross_bookings_usd, 0) end ) as grocery_liqor_gb
+
+        from
+           india_growth.anz_xp_base_v2 as xp 
+            left join eds.fact_eats_trip fe on fe.client_uuid = xp.client_uuid
+            and datestr >= '{{xp_date}}' and datestr <= '{{xp_end_date}}' 
+            and date(fe.eater_request_timestamp_utc) >= date ('{{xp_date}}')
+            and is_completed = true
+
+          JOIN eds.dim_merchant dm ON fe.restaurant_uuid = dm.uuid   --- to get eats and other verticals 
+           and is_completed = true
+         
+         JOIN secure_finance.fds_workflow_eats_op_dt fdse
+          ON fe.workflow_uuid = fdse.workflow_uuid
+        --   and  operational_date >=  TO_ISO8601(FROM_ISO8601_DATE('{{xp_date}}') ) 
+        --   and  operational_date <=  TO_ISO8601(FROM_ISO8601_DATE('{{xp_end_date}}') )
+
+          AND DATE(fdse.operational_date) >= DATE('{{xp_date}}')
+            AND DATE(fdse.operational_date) <= DATE('{{xp_end_date}}')
+
+        group by 1,2,3,4,5,6,7,8,9
+        )
+
+
+,timeline as (
+
+    with base as 
+            (  select  
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,xp.quarter_freq
+                ,xp.lifetime_freq
+                ,xp.member
+
+                ,rt.Trips_week as rides_trip
+                ,rt.completed_trips
+
+                ,rg.Trips_week as rides_gb_week
+                ,rg.gb
+
+                ,eg.Trips_week as eats_week
+                ,eg.eats_trips
+                ,eg.eats_gb
+
+
+          from  india_growth.anz_xp_base_v2 as xp 
+           left join rides_trips as rt 
+           on xp.client_uuid = rt.client_uuid and xp.cohort = rt.cohort and xp.campaign_name = rt.campaign_name  and xp.country_id = rt.country_id and xp.quarter_freq = rt.quarter_freq and xp.lifetime_freq = rt.lifetime_freq and xp.member = rt.member
+
+          left join rides_GB as rg 
+           on xp.client_uuid = rg.client_uuid and xp.cohort = rg.cohort  and xp.campaign_name = rg.campaign_name  and xp.country_id = rg.country_id and xp.quarter_freq = rg.quarter_freq and xp.lifetime_freq = rg.lifetime_freq and xp.member = rg.member
+
+           left join eats_trips_n_GB as eg 
+           on xp.client_uuid = eg.client_uuid and xp.cohort = eg.cohort  and xp.campaign_name = eg.campaign_name  and xp.country_id = eg.country_id and xp.quarter_freq = eg.quarter_freq and xp.lifetime_freq = eg.lifetime_freq and xp.member = eg.member    
+
+          ) 
+
+
+            select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,xp.quarter_freq
+                ,xp.lifetime_freq
+                ,xp.member
+                ,coalesce(rides_trip, rides_gb_week, eats_week) trips_week
+
+                ,sum(coalesce(completed_trips,0))rides_trip
+                ,sum(coalesce(gb,0))rides_gb
+
+                ,sum(coalesce(eats_trips,0))eats_trips
+                ,sum(coalesce(eats_gb,0))eats_gb
+                
+                ,sum(coalesce(completed_trips,0) + coalesce(eats_trips,0)) overall_trip
+                ,sum(coalesce(gb,0) + coalesce(eats_gb,0)) overall_gb
+
+                from base as xp
+                group by 1,2,3,4,5,6,7,8,9
+         )
+
+     select * from timeline
+
+
+--934531 user n 1703622
+
+
+-- country level 
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,trips_week
+            , '1 all cohorts' as segment
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,trips_week
+            , quarter_freq as segment
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+    
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,trips_week
+            , lifetime_freq as segment
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+      
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,trips_week
+            ,member as segment
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+    
+     union all
+-- overall level 
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,trips_week
+            , '1 all cohorts' as segment
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,trips_week
+            , quarter_freq as segment
+
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+    
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,trips_week
+            ,lifetime_freq as segment
+
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+      
+     union all 
+    
+    select campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,trips_week
+            ,member as segment
+
+            ,count(distinct client_uuid) base
+            ,count(distinct case when rides_trip > 0 then client_uuid end)rides_user
+            ,count(distinct case when eats_trips > 0 then client_uuid end)eats_user
+            ,count(distinct case when rides_trip > 0 or eats_trips > 0 then client_uuid end)overall_user
+
+            ,sum(rides_trip)rides_trip
+            ,sum(eats_trips)eats_trips
+            ,sum(overall_trip)overall_trip
+
+            ,sum(rides_gb)rides_gb
+            ,sum(eats_gb)eats_gb
+            ,sum(overall_gb)overall_gb
+
+
+        from  india_growth.anz_xp_7_14_21_cohort_v2   
+         group by 1,2,3,4,5,6
+
+
+
+------------------------------------------------------------------------------------------------------------------------
+----------------------- product selected for  different cohorts (treatments vs control )  --------------------
+--------------------------------------------------------------------------------------------------------------------------
+
+
+with rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,ft.global_product_name
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) >= date('{{xp_date}}')
+
+                join dwh.fact_trip ft 
+                on ac.first_trip_uuid = ft.uuid
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9
+
+             )
+
+      select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,global_product_name
+
+        ,count(distinct client_uuid) as E2R_user_ft
+        from rides_first_trips
+        group by 1,2,3,4,5
+
+   union all 
+     select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as  country_id
+            ,global_product_name
+
+        ,count(distinct client_uuid) as E2R_user_ft
+        from rides_first_trips
+        group by 1,2,3,4,5
+        order by 2 desc
+
+
+----------------------- Non promo trip product type  --------------------
+
+with control_trips as (
+                select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,first_trip_uuid
+                ,ft.global_product_name
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) >= date('{{xp_date}}')
+
+                join dwh.fact_trip ft 
+                on ac.first_trip_uuid = ft.uuid
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') + INTERVAL '15' day
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')   
+
+                and  cohort in ('control')
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9,10
+
+             )
+
+, non_promo_trips as (
+                select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,second_settled_trip_uuid
+                ,ft.global_product_name
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) >= date('{{xp_date}}')
+
+                join dwh.fact_trip ft 
+                on ac.second_settled_trip_uuid = ft.uuid
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') + INTERVAL '15' day
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')   
+
+                and  cohort in ('treatment2', 'treatment1')
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9,10
+
+             )
+
+,non_promo_trips_t3 as  (
+                               
+                with base as (
+                select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,ft.request_timestamp_utc
+                ,ft.global_product_name
+
+                ,rank() over( partition by xp.client_uuid, xp.country_id order by ft.request_timestamp_utc desc)trip_rank
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) >= date('{{xp_date}}')
+
+                join dwh.fact_trip ft 
+                on ac.user_uuid = ft.client_uuid
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') + INTERVAL '15' day
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')   
+                and  cohort in ('treatment3') 
+                and ft.uuid not in (first_trip_uuid,second_settled_trip_uuid )
+          
+        --   where ac.user_uuid is null        
+           --  group by 1,2,3,4,5,6,7,8
+
+             )
+
+        select * from base  where trip_rank = 2 
+
+        )
+
+    select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,global_product_name
+
+        ,count(distinct client_uuid) as E2R_user_ft
+        from control_trips
+        group by 1,2,3,4,5
+      
+      union all
+
+    select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,global_product_name
+
+        ,count(distinct client_uuid) as E2R_user_ft
+        from non_promo_trips
+        group by 1,2,3,4,5
+
+      union all
+
+    select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,global_product_name
+
+        ,count(distinct client_uuid) as E2R_user_ft
+        from non_promo_trips_t3
+        group by 1,2,3,4,5  
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------
+----------------------- Length of First trip  --------------------
+--------------------------------------------------------------------------------------------------------------------------
+
+with rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,avg(trip_distance_miles) avg_trip_distance
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) >= date('{{xp_date}}')
+
+                join dwh.fact_trip ft 
+                on ac.first_trip_uuid = ft.uuid
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8
+
+             )
+
+      select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,avg(avg_trip_distance)avg_trip_distance
+            ,approx_percentile(avg_trip_distance , 0.50) med_trip_distance
+          ,count(distinct client_uuid) as E2R_user_ft
+          from rides_first_trips
+          group by 1,2,3,4
+
+  --  union all 
+ 
+  --    select 
+  --        campaign_name
+  --          ,cohort
+  --           ,tag_name
+  --           ,1000 as  country_id
+  --           ,avg(avg_trip_distance)avg_trip_distance
+  --           ,approx_percentile(avg_trip_distance , 0.50) med_trip_distance
+
+  --       ,count(distinct client_uuid) as E2R_user_ft
+  --       from rides_first_trips
+  --       group by 1,2,3,4
+  --       order by 2 desc
+
+
+
+------------ Histogram
+
+
+with rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,avg(trip_distance_miles) avg_trip_distance
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) >= date('{{xp_date}}')
+
+                join dwh.fact_trip ft 
+                on ac.first_trip_uuid = ft.uuid
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8
+
+             )
+
+      select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+
+            , round(avg_trip_distance, 0)trip_distance
+            -- ,avg(avg_trip_distance)avg_trip_distance
+            -- ,approx_percentile(avg_trip_distance , 0.50) med_trip_distance
+            ,count(distinct client_uuid) as E2R_user_ft
+            from rides_first_trips
+            group by 1,2,3,4,5
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------
+----------------------- Device of Users taken FTs  --------------------
+--------------------------------------------------------------------------------------------------------------------------
+
+with rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,ft.client_device
+                ,ft.device_os
+                ,count(*)cnt
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) >= date('{{xp_date}}')
+
+                join dwh.fact_trip ft 
+                on ac.first_trip_uuid = ft.uuid
+                and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+                and ft.status = 'completed' 
+                AND ft.marketplace = 'personal_transport'
+                and date(ft.request_timestamp_utc) >= date('{{xp_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9,10
+
+             )
+
+
+     select 
+          cohort
+         , device_os 
+         , client_device 
+         , country_id
+         , count(distinct client_uuid)user
+
+      from rides_first_trips
+       group by 1,2,3,4
+
+    union all
+
+    select 
+          cohort
+         , device_os 
+         , client_device 
+         , 1000 as country_id
+         , count(distinct client_uuid)user
+
+      from rides_first_trips
+       group by 1,2,3,4
+
+
+------------------------------------------------------------------------------------------------------------------------
+----------------------- eats order before converting to FT rides   --------------------
+--------------------------------------------------------------------------------------------------------------------------
+
+with rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,first_trip_request_timestamp
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9
+
+             )
+
+
+,eats_order as (
+          select  
+                bs.campaign_name
+                ,bs.cohort
+                ,bs.tag_name
+                ,bs.country_id
+                ,bs.client_uuid
+                ,bs.quarter_freq
+                ,bs.lifetime_freq
+                ,bs.member
+                ,bs.first_trip_request_timestamp
+                ,count(distinct ea.order_trip_uuid) as n_orders
+
+            from rides_first_trips as bs 
+            join eds.fact_eats_trip ea 
+            on bs.client_uuid = ea.client_uuid 
+            and date(ea.datestr)  BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')
+            -- and date(ea.datestr) >= date(first_eats_timestamp)
+            and ea.is_completed = True
+            and ea.eater_request_timestamp_utc < first_trip_request_timestamp
+
+            group by 1,2,3,4,5,6,7,8,9
+          ) 
+
+
+        select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,n_orders
+            ,count(distinct client_uuid) as user
+
+            from eats_order 
+            group by 1,2,3,4,5
+
+        union all   
+
+        select 
+         campaign_name
+           ,cohort
+            ,tag_name
+            ,1000 as country_id
+            ,n_orders
+            ,count(distinct client_uuid) as user
+
+            from eats_order 
+            group by 1,2,3,4,5  
+
+      
+
+---------------------------------------------------------------------------------------------------------------------
+------------------ 5.11 user becomes x-p after how many sessions
+
+
+with rides_first_trips as (
+        select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,first_trip_request_timestamp
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9
+
+             )
+
+,eater_ssn_N_rqsts_app as(
+          select 
+          campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,client_uuid
+            , count(distinct case when element_at(event_map, 'request') is not null
+              then session_uuid end) as session_with_requests
+
+          , count(distinct session_uuid) as sessions
+
+          from  rides_first_trips as bs 
+          join eds.fact_eater_app_session as ea
+          on bs.client_uuid = ea.user_uuid
+          and Date(ea.datestr) < Date(first_trip_request_timestamp)
+           where Date(ea.datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')
+           
+    
+          -- 'Valid' sessions only
+          -- Based on our intuitive definition of what a valid session means
+          -- This definition might change as we get a clearer understanding of 
+          -- what constitutes a valid session and how to track that
+           and (element_at(event_map, 'view_marketplace') is not null
+              or element_at(event_map, 'view_store') is not null
+              or element_at(event_map, 'search') is not null
+              or element_at(event_map, 'view_search') is not null
+              or element_at(event_map, 'view_store_item') is not null
+              or element_at(event_map, 'view_checkout') is not null
+              or element_at(event_map, 'add_store_item_to_cart') is not null
+              or element_at(event_map, 'request') is not null
+              or element_at(event_map, 'succeed_order_estimate') is not null
+              or element_at(event_map, 'succeed_request') is not null
+              )
+              group by 1,2,3,4,5
+        
+          )
+
+    select  
+        campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+        ,sessions
+        ,count(distinct client_uuid) as user
+
+       from eater_ssn_N_rqsts_app 
+       group by 1,2,3,4,5
+
+
+
+------------------------------------------------------------------------------------------------------------------------
+----------------------- GB trend of eater took FT after 1 order on eats /2 orders on eats and so on  --------------------
+--------------------------------------------------------------------------------------------------------------------------
+
+
+
+with rides_first_trips as (
+      with abc as ( select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,first_trip_request_timestamp
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9 
+
+        )
+
+      select 
+         a.*  ,case when first_trip_request_timestamp >= Date '2022-01-21' and first_trip_request_timestamp <= Date '2022-01-27' then '1'
+                      when first_trip_request_timestamp >= Date '2022-01-28' and first_trip_request_timestamp <= Date '2022-02-03' then '2'
+                      when first_trip_request_timestamp >= Date '2022-02-04' and first_trip_request_timestamp <=Date '2022-02-10' then '3'
+                      when first_trip_request_timestamp >= Date '2022-02-11' and first_trip_request_timestamp <= Date '2022-02-17' then '4'
+                      when first_trip_request_timestamp >= Date '2022-02-18' and first_trip_request_timestamp <= Date '2022-02-24' then '5'
+                      when first_trip_request_timestamp >= Date '2022-02-25' and first_trip_request_timestamp <= Date '2022-03-03' then '6'
+                      end as FT_week
+
+         from abc   as a               
+       
+       )
+
+,eats_order as (
+          select  
+                bs.campaign_name
+                ,bs.cohort
+                ,bs.tag_name
+                ,bs.country_id
+                ,bs.client_uuid
+                ,bs.quarter_freq
+                ,bs.lifetime_freq
+                ,bs.member
+                ,bs.first_trip_request_timestamp
+                ,FT_week
+                ,count(distinct ea.order_trip_uuid) as n_orders
+
+            from rides_first_trips as bs 
+            join eds.fact_eats_trip ea 
+            on bs.client_uuid = ea.client_uuid 
+            and date(ea.datestr)  BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')
+            -- and date(ea.datestr) >= date(first_eats_timestamp)
+            and ea.is_completed = True
+            and ea.eater_request_timestamp_utc < first_trip_request_timestamp
+
+            group by 1,2,3,4,5,6,7,8,9,10
+          ) 
+
+-- , rides_trips as (
+--         select  xp.campaign_name
+--                 ,xp.cohort
+--                 ,xp.tag_name
+--                 ,xp.country_id
+--                 ,xp.client_uuid
+--                 , xp.quarter_freq
+--                 ,xp.lifetime_freq
+--                 ,xp.member
+--                 ,case when request_timestamp_utc >= Date '2022-01-21' and request_timestamp_utc <= Date '2022-01-27' then '1'
+--                       when request_timestamp_utc >= Date '2022-01-28' and request_timestamp_utc <= Date '2022-02-03' then '2'
+--                       when request_timestamp_utc >= Date '2022-02-04' and request_timestamp_utc <=Date '2022-02-10' then '3'
+--                       when request_timestamp_utc >= Date '2022-02-11' and request_timestamp_utc <= Date '2022-02-17' then '4'
+--                       when request_timestamp_utc >= Date '2022-02-18' and request_timestamp_utc <= Date '2022-02-24' then '5'
+--                       when request_timestamp_utc >= Date '2022-02-25' and request_timestamp_utc <= Date '2022-03-03' then '6'
+--                       end as Trips_week
+
+--                 ,count(ft.uuid) as completed_trips
+
+--               from india_growth.anz_xp_base_v2 xp 
+--                join dwh.fact_trip ft 
+--                 on ft.client_uuid = xp.client_uuid
+                
+--                 and date(datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}') 
+--                 and ft.status = 'completed' 
+--                 AND ft.marketplace = 'personal_transport'
+--                 and date(ft.request_timestamp_utc) >= date ('{{xp_date}}')
+--                 group by 1,2,3,4,5,6,7,8,9
+--             )
+
+
+, trip_kpis as (
+
+    select 
+        xp.campaign_name
+        ,xp.cohort
+        ,xp.tag_name
+        ,xp.country_id
+        ,xp.client_uuid
+        ,xp.quarter_freq
+        ,xp.lifetime_freq
+        ,xp.member
+        ,xp.first_trip_request_timestamp
+        ,xp.FT_week
+        -- ,xp.n_orders
+        ,case when xp.n_orders between 1 and 3 then '1_to_3'
+              when xp.n_orders between 4 and 5 then '4_to_5'
+              when xp.n_orders between 6 and 10 then '5_to_10'
+              when xp.n_orders >= 10 then 'more_than_10' 
+              end as num_eats_order
+
+        ,case when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-01-27' then '1'
+                      when date(operational_date) >= Date '2022-01-28' and date(operational_date) <= Date '2022-02-03' then '2'
+                      when date(operational_date) >= Date '2022-02-04' and date(operational_date) <=Date '2022-02-10' then '3'
+                      when date(operational_date) >= Date '2022-02-11' and date(operational_date) <= Date '2022-02-17' then '4'
+                      when date(operational_date) >= Date '2022-02-18' and date(operational_date) <= Date '2022-02-24' then '5'
+                      when date(operational_date) >= Date '2022-02-25' and date(operational_date) <= Date '2022-03-03' then '6' 
+                      when date(operational_date) >= Date '2022-03-04' and date(operational_date) <= Date '2022-03-10' then '7'
+                      end as Trips_week
+
+        , sum(gross_bookings_usd ) as gb
+
+        -- , max(cast(operational_date as timestamp)) as max_date_trips
+        -- , min(cast(operational_date as timestamp)) as min_date_trips
+    
+    from secure_finance.fds_jobs_rides_op_dt fds 
+     join eats_order xp on xp.client_uuid = fds.client_uuid 
+
+    and fds.status = 'COMPLETED'
+    --    and fds.line_of_business in ('TNP','UberPOOL')
+        
+        and date(operational_date) >= DATE('{{xp_date}}')
+        and date(operational_date) <= DATE('{{xp_end_date}}') + INTERVAL '20' day
+
+        and date(operational_date) >= date(first_trip_request_timestamp)
+
+        where FT_week is not null
+    
+       group by 1,2,3,4,5,6,7,8,9,10,11,12
+    
+    )
+
+
+
+-- ,timeline as (
+
+--        select ft.* , trips.Trips_week , trips.completed_trips, gb
+
+--          from  rides_first_trips as ft 
+
+--          left join rides_trips as trips
+--            on ft.client_uuid = trips.client_uuid and ft.campaign_name = trips.campaign_name and ft.cohort = trips.cohort  
+--              and ft.country_id = trips.country_id and trips.Trips_week >= FT_week
+        
+--         join trip_kpis as kp
+--           on trips.client_uuid = kp.client_uuid and trips.campaign_name = kp.campaign_name and trips.cohort = kp.cohort  
+--              and trips.country_id = kp.country_id and trips.Trips_week = kp.Trips_week
+
+
+--         ) 
+
+
+-- country level 
+        select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            
+            ,FT_week
+            ,num_eats_order
+            ,Trips_week
+
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+         from  trip_kpis   
+          group by 1,2,3,4,5,6,7
+
+
+    --  union all 
+    
+    -- select campaign_name
+    --        ,cohort
+    --         ,tag_name
+    --         ,country_id
+    --         ,FT_week
+    --         ,trips_week
+    --         , quarter_freq as segment
+    --         ,count(distinct client_uuid) user
+    --         ,sum(gb)gb
+
+    --     from  timeline   
+    --      group by 1,2,3,4,5,6,7
+    
+    --  union all 
+    
+    -- select campaign_name
+    --        ,cohort
+    --         ,tag_name
+    --         ,country_id
+    --         ,FT_week
+    --         ,trips_week
+    --         , lifetime_freq as segment
+    --         ,count(distinct client_uuid) user
+    --         ,sum(gb)gb
+
+    --     from  timeline   
+    --      group by 1,2,3,4,5,6,7
+      
+    --  union all 
+    
+    -- select campaign_name
+    --        ,cohort
+    --         ,tag_name
+    --         ,country_id
+    --         ,FT_week
+    --         ,trips_week
+    --         , member as segment
+    --         ,count(distinct client_uuid) user
+    --         ,sum(gb)gb
+
+    --     from  timeline   
+    --      group by 1,2,3,4,5,6,7 
+   
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------
+----------------------- GB trend of eater took FT after 1 session on eats /2 sessions on eats and so on  --------------------
+--------------------------------------------------------------------------------------------------------------------------
+
+
+
+with rides_first_trips as (
+      with abc as ( select 
+                xp.campaign_name
+                ,xp.cohort
+                ,xp.tag_name
+                ,xp.country_id
+                ,xp.client_uuid
+                ,quarter_freq
+                ,lifetime_freq
+                ,member
+                ,first_trip_request_timestamp
+        
+                from india_growth.anz_xp_base_v2  xp 
+                join dwh.analytics_client as ac 
+                on xp.client_uuid = ac.user_uuid
+                and date(first_trip_request_timestamp) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')           
+          
+        --   where ac.user_uuid is null        
+             group by 1,2,3,4,5,6,7,8,9 
+
+        )
+
+      select 
+         a.*  ,case when first_trip_request_timestamp >= Date '2022-01-21' and first_trip_request_timestamp <= Date '2022-01-27' then '1'
+                      when first_trip_request_timestamp >= Date '2022-01-28' and first_trip_request_timestamp <= Date '2022-02-03' then '2'
+                      when first_trip_request_timestamp >= Date '2022-02-04' and first_trip_request_timestamp <=Date '2022-02-10' then '3'
+                      when first_trip_request_timestamp >= Date '2022-02-11' and first_trip_request_timestamp <= Date '2022-02-17' then '4'
+                      when first_trip_request_timestamp >= Date '2022-02-18' and first_trip_request_timestamp <= Date '2022-02-24' then '5'
+                      when first_trip_request_timestamp >= Date '2022-02-25' and first_trip_request_timestamp <= Date '2022-03-03' then '6'
+                      end as FT_week
+
+         from abc   as a               
+       
+       )
+
+,eater_ssn_N_rqsts_app as(
+          select 
+          campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            ,client_uuid
+            ,first_trip_request_timestamp
+            ,FT_week
+            , count(distinct case when element_at(event_map, 'request') is not null
+              then session_uuid end) as session_with_requests
+
+          , count(distinct session_uuid) as sessions
+
+          from  rides_first_trips as bs 
+          join eds.fact_eater_app_session as ea
+          on bs.client_uuid = ea.user_uuid
+          and Date(ea.datestr) < Date(first_trip_request_timestamp)
+           where Date(ea.datestr) BETWEEN DATE('{{xp_date}}') and DATE('{{xp_end_date}}')
+           
+    
+          -- 'Valid' sessions only
+          -- Based on our intuitive definition of what a valid session means
+          -- This definition might change as we get a clearer understanding of 
+          -- what constitutes a valid session and how to track that
+           and (element_at(event_map, 'view_marketplace') is not null
+              or element_at(event_map, 'view_store') is not null
+              or element_at(event_map, 'search') is not null
+              or element_at(event_map, 'view_search') is not null
+              or element_at(event_map, 'view_store_item') is not null
+              or element_at(event_map, 'view_checkout') is not null
+              or element_at(event_map, 'add_store_item_to_cart') is not null
+              or element_at(event_map, 'request') is not null
+              or element_at(event_map, 'succeed_order_estimate') is not null
+              or element_at(event_map, 'succeed_request') is not null
+              )
+              group by 1,2,3,4,5,6,7
+        
+          )
+
+
+, trip_kpis as (
+
+    select 
+        xp.campaign_name
+        ,xp.cohort
+        ,xp.tag_name
+        ,xp.country_id
+        ,xp.client_uuid
+        ,xp.first_trip_request_timestamp
+        ,xp.FT_week
+        -- ,xp.n_orders
+        ,case when xp.sessions between 1 and 3 then '1_to_3'
+              when xp.sessions between 4 and 5 then '4_to_5'
+              when xp.sessions between 6 and 10 then '5_to_10'
+              when xp.sessions >= 10 then 'more_than_10' 
+              end as num_eats_ssn
+
+        ,case when date(operational_date) >= Date '2022-01-21' and date(operational_date) <= Date '2022-01-27' then '1'
+                      when date(operational_date) >= Date '2022-01-28' and date(operational_date) <= Date '2022-02-03' then '2'
+                      when date(operational_date) >= Date '2022-02-04' and date(operational_date) <=Date '2022-02-10' then '3'
+                      when date(operational_date) >= Date '2022-02-11' and date(operational_date) <= Date '2022-02-17' then '4'
+                      when date(operational_date) >= Date '2022-02-18' and date(operational_date) <= Date '2022-02-24' then '5'
+                      when date(operational_date) >= Date '2022-02-25' and date(operational_date) <= Date '2022-03-03' then '6' 
+                      when date(operational_date) >= Date '2022-03-04' and date(operational_date) <= Date '2022-03-10' then '7'
+                      end as Trips_week
+
+        , sum(gross_bookings_usd ) as gb
+
+        -- , max(cast(operational_date as timestamp)) as max_date_trips
+        -- , min(cast(operational_date as timestamp)) as min_date_trips
+    
+    from secure_finance.fds_jobs_rides_op_dt fds 
+     join eater_ssn_N_rqsts_app xp on xp.client_uuid = fds.client_uuid 
+
+    and fds.status = 'COMPLETED'
+    --    and fds.line_of_business in ('TNP','UberPOOL')
+        
+        and date(operational_date) >= DATE('{{xp_date}}')
+        and date(operational_date) <= DATE('{{xp_end_date}}') + INTERVAL '20' day
+
+        and date(operational_date) >= date(first_trip_request_timestamp)
+        where FT_week is not null
+    
+    group by 1,2,3,4,5,6,7,8,9
+    
+    )
+
+
+
+-- ,timeline as (
+
+--        select ft.* , trips.Trips_week , trips.completed_trips, gb
+
+--          from  rides_first_trips as ft 
+
+--          left join rides_trips as trips
+--            on ft.client_uuid = trips.client_uuid and ft.campaign_name = trips.campaign_name and ft.cohort = trips.cohort  
+--              and ft.country_id = trips.country_id and trips.Trips_week >= FT_week
+        
+--         join trip_kpis as kp
+--           on trips.client_uuid = kp.client_uuid and trips.campaign_name = kp.campaign_name and trips.cohort = kp.cohort  
+--              and trips.country_id = kp.country_id and trips.Trips_week = kp.Trips_week
+
+
+--         ) 
+
+
+-- country level 
+        select campaign_name
+           ,cohort
+            ,tag_name
+            ,country_id
+            
+            ,FT_week
+            ,num_eats_ssn
+            ,Trips_week
+
+            ,count(distinct client_uuid) user
+            ,sum(gb)gb
+
+         from  trip_kpis   
+          group by 1,2,3,4,5,6,7
+
+
+
